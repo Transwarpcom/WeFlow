@@ -9,6 +9,16 @@
   它可以获取你的微信聊天记录并将其导出，还可以根据你的聊天记录为你生成独一无二的数据与年度报告。
 </p>
 
+## 常见问题（FAQ）
+
+### 图片如何在“未在微信中点开”的情况下导出原图？
+
+当前 WeFlow 的图片导出依赖本地可解密文件：  
+- **未在微信中点开过的图片**：通常只能拿到缩略图；  
+- **已点开过的图片**：可导出正常清晰度图片。  
+
+项目目前没有提供“从微信云端拉取并解密原图”的能力，也不计划为此单独实现一套仅覆盖近三天缓存的云端方案。
+
 <p align="center">
   <a href="https://github.com/hicccc77/WeFlow/stargazers"><img src="https://img.shields.io/github/stars/hicccc77/WeFlow?style=flat&label=Stars&labelColor=2A3B4C&color=60A5FA" alt="Stargazers"></a>
   <a href="https://github.com/hicccc77/WeFlow/network/members"><img src="https://img.shields.io/github/forks/hicccc77/WeFlow?style=flat&label=Forks&labelColor=2A3B4C&color=60A5FA" alt="Forks"></a>
