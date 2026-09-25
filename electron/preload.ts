@@ -90,6 +90,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.on('app:updateAvailable', (_, info) => callback(info))
       return () => ipcRenderer.removeAllListeners('app:updateAvailable')
     },
+    onSystemResume: (callback: () => void) => {
+      const listener = () => callback()
+      ipcRenderer.on('app:systemResume', listener)
+      return () => ipcRenderer.removeListener('app:systemResume', listener)
+    },
   },
 
   // 日志

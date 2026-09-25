@@ -4,6 +4,10 @@ import type { ChatSession, Message } from '../types/models'
 import { buildNewMessagesCursor } from '../pages/Chat/messageCursor'
 import { displayNameOrFallback, pickDisplayName } from '../utils/displayName'
 
+const RESUME_NOTIFICATION_QUIET_MS = 45_000
+const RESUME_NOTIFICATION_SETTLE_MS = 10_000
+const RESUME_NOTIFICATION_MAX_MS = 3 * 60_000
+
 export function GlobalSessionMonitor() {
     const {
         sessions,
@@ -12,10 +16,25 @@ export function GlobalSessionMonitor() {
     } = useChatStore()
 
     const sessionsRef = useRef(sessions)
+    const notificationQuietUntilRef = useRef(0)
+    const notificationQuietMaxUntilRef = useRef(0)
     // 保持 ref 同步
     useEffect(() => {
         sessionsRef.current = sessions
     }, [sessions])
+
+    // 从系统睡眠恢复后，数据库可能连续发出一批休眠期间积累的 Session 变更。
+    // 静默一段时间并在变更持续时延长静默，期间仍刷新会话状态作为新通知基线。
+    useEffect(() => {
+        const removeResumeListener = window.electronAPI.app.onSystemResume(() => {
+            const now = Date.now()
+            notificationQuietUntilRef.current = now + RESUME_NOTIFICATION_QUIET_MS
+            notificationQuietMaxUntilRef.current = now + RESUME_NOTIFICATION_MAX_MS
+            console.info('[NotificationFilter] Suppressing catch-up notifications after system resume')
+        })
+
+        return () => removeResumeListener()
+    }, [])
 
     // 去重辅助函数：获取消息 key
     const getMessageKey = (msg: Message) => {
@@ -54,6 +73,13 @@ export function GlobalSessionMonitor() {
 
                 // 只关注 Session 表
                 if (tableName === 'Session' || tableName === 'session') {
+                    const now = Date.now()
+                    if (now < notificationQuietMaxUntilRef.current) {
+                        notificationQuietUntilRef.current = Math.min(
+                            notificationQuietMaxUntilRef.current,
+                            now + RESUME_NOTIFICATION_SETTLE_MS
+                        )
+                    }
                     if (debounceTimer) clearTimeout(debounceTimer)
                     debounceTimer = setTimeout(() => {
                         debounceTimer = null
@@ -87,8 +113,15 @@ export function GlobalSessionMonitor() {
                 const newSessions = result.sessions as ChatSession[]
                 const oldSessions = sessionsRef.current
 
-                // 1. 检测变更并通知
-                checkForNewMessages(oldSessions, newSessions)
+                // 1. 检测变更并通知。恢复静默期间只更新基线，不逐条补发通知。
+                if (Date.now() >= notificationQuietUntilRef.current) {
+                    await checkForNewMessages(oldSessions, newSessions)
+                } else {
+                    console.info('[NotificationFilter] Skipping notifications while session state catches up')
+                }
+
+                // 立即同步 ref，确保后续排队刷新以最新快照作比较基线。
+                sessionsRef.current = newSessions
 
                 // 2. 更新 store
                 setSessions(newSessions)
@@ -122,6 +155,9 @@ export function GlobalSessionMonitor() {
         const oldMap = new Map(oldSessions.map(s => [s.username, s]))
 
         for (const newSession of newSessions) {
+            // 如果系统在通知联系人信息查询期间进入睡眠并恢复，停止当前补发循环。
+            if (Date.now() < notificationQuietUntilRef.current) return
+
             const oldSession = oldMap.get(newSession.username)
 
             // 条件: 新会话或时间戳更新
@@ -280,6 +316,8 @@ export function GlobalSessionMonitor() {
                     console.warn('[NotificationFilter] 跳过无法识别的用户通知:', newSession.username)
                     continue
                 }
+
+                if (Date.now() < notificationQuietUntilRef.current) return
 
                 // 调用 IPC 以显示独立窗口通知
                 window.electronAPI.notification?.show({

@@ -1,5 +1,5 @@
 import './preload-env'
-import { app, BrowserWindow, ipcMain, nativeTheme, session, Tray, Menu, nativeImage } from 'electron'
+import { app, BrowserWindow, ipcMain, nativeTheme, session, Tray, Menu, nativeImage, powerMonitor } from 'electron'
 import { Worker } from 'worker_threads'
 import { randomUUID } from 'crypto'
 import { join, dirname } from 'path'
@@ -4550,6 +4550,13 @@ function checkForUpdatesOnStartup() {
 }
 
 app.whenReady().then(async () => {
+  // 系统从睡眠恢复后，微信数据库可能会集中同步休眠期间的会话状态。
+  // 通知层需要先静默重建会话基线，避免把补同步的数据逐条弹出。
+  powerMonitor.on('resume', () => {
+    if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return
+    mainWindow.webContents.send('app:systemResume')
+  })
+
   // 先初始化配置，以便在启动早期判定是否需要静默启动
   configService = new ConfigService()
   applyAutoUpdateChannel('startup')
