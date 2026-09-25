@@ -48,20 +48,24 @@ export function GlobalSessionMonitor() {
         let debounceTimer: ReturnType<typeof setTimeout> | null = null
         let refreshing = false
         let pendingRefresh = false
+        let pendingRefreshSuppressNotifications = false
 
-        const runRefresh = async () => {
+        const runRefresh = async (suppressNotifications = false) => {
             if (refreshing) {
                 pendingRefresh = true
+                pendingRefreshSuppressNotifications ||= suppressNotifications
                 return
             }
             refreshing = true
             try {
-                await refreshSessions()
+                await refreshSessions(suppressNotifications)
             } finally {
                 refreshing = false
                 if (pendingRefresh) {
                     pendingRefresh = false
-                    void runRefresh()
+                    const suppressPending = pendingRefreshSuppressNotifications
+                    pendingRefreshSuppressNotifications = false
+                    void runRefresh(suppressPending)
                 }
             }
         }
@@ -79,6 +83,19 @@ export function GlobalSessionMonitor() {
                             notificationQuietMaxUntilRef.current,
                             now + RESUME_NOTIFICATION_SETTLE_MS
                         )
+
+                        // 睡眠恢复的补同步可能连续改写 Session。先合并这些事件，
+                        // 等变更安静下来后只读一次完整会话快照。
+                        if (debounceTimer) clearTimeout(debounceTimer)
+                        const catchupDelay = Math.min(
+                            RESUME_NOTIFICATION_SETTLE_MS,
+                            Math.max(0, notificationQuietMaxUntilRef.current - now)
+                        )
+                        debounceTimer = setTimeout(() => {
+                            debounceTimer = null
+                            void runRefresh(true)
+                        }, catchupDelay)
+                        return
                     }
                     if (debounceTimer) clearTimeout(debounceTimer)
                     debounceTimer = setTimeout(() => {
@@ -106,7 +123,7 @@ export function GlobalSessionMonitor() {
     // 导出页打开时按需拉取可见批次的会话统计，主进程有磁盘缓存兜底，响应速度足够快。
 
 
-    const refreshSessions = async () => {
+    const refreshSessions = async (suppressNotifications = false) => {
         try {
             const result = await window.electronAPI.chat.getSessions()
             if (result.success && result.sessions && Array.isArray(result.sessions)) {
@@ -114,7 +131,7 @@ export function GlobalSessionMonitor() {
                 const oldSessions = sessionsRef.current
 
                 // 1. 检测变更并通知。恢复静默期间只更新基线，不逐条补发通知。
-                if (Date.now() >= notificationQuietUntilRef.current) {
+                if (!suppressNotifications && Date.now() >= notificationQuietUntilRef.current) {
                     await checkForNewMessages(oldSessions, newSessions)
                 } else {
                     console.info('[NotificationFilter] Skipping notifications while session state catches up')
