@@ -361,6 +361,7 @@ class ChatService {
   private runtimeConfig?: { dbPath?: string; decryptKey?: string; myWxid?: string }
   private connected = false
   private readonly dbMonitorListeners = new Set<(type: string, json: string) => void>()
+  private sessionsInFlight: Promise<{ success: boolean; sessions?: ChatSession[]; error?: string }> | null = null
   private messageCursors: Map<string, { cursor: number; fetched: number; batchSize: number; startTime?: number; endTime?: number; ascending?: boolean; bufferedMessages?: any[] }> = new Map()
   private messageCursorMutex: boolean = false
   private readonly messageBatchDefault = 50
@@ -756,6 +757,7 @@ class ChatService {
   }
 
   close(): void {
+    this.sessionsInFlight = null
     try {
       for (const state of this.messageCursors.values()) {
         wcdbService.closeMessageCursor(state.cursor)
@@ -856,6 +858,18 @@ class ChatService {
    * 获取会话列表（优化：先返回基础数据，不等待联系人信息加载）
    */
   async getSessions(): Promise<{ success: boolean; sessions?: ChatSession[]; error?: string }> {
+    // 会话页和通知监听器可能同时请求全量快照，复用正在进行的读取。
+    if (this.sessionsInFlight) return this.sessionsInFlight
+    const request = this.loadSessions()
+    this.sessionsInFlight = request
+    try {
+      return await request
+    } finally {
+      if (this.sessionsInFlight === request) this.sessionsInFlight = null
+    }
+  }
+
+  private async loadSessions(): Promise<{ success: boolean; sessions?: ChatSession[]; error?: string }> {
     try {
       const connectResult = await this.ensureConnected()
       if (!connectResult.success) {

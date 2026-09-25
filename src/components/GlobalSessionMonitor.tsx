@@ -7,6 +7,18 @@ import { displayNameOrFallback, pickDisplayName } from '../utils/displayName'
 const RESUME_NOTIFICATION_QUIET_MS = 45_000
 const RESUME_NOTIFICATION_SETTLE_MS = 10_000
 const RESUME_NOTIFICATION_MAX_MS = 3 * 60_000
+const SESSION_CHANGE_DEBOUNCE_MS = 400
+const MIN_SESSION_REFRESH_INTERVAL_MS = 2_000
+const MAX_NOTIFICATION_CANDIDATES_PER_REFRESH = 3
+
+function isOwnGroupMessage(session: ChatSession): boolean {
+    if (!session.username.includes('@chatroom') || !session.lastMsgSender || !session.selfWxid) return false
+    const sender = session.lastMsgSender
+    const self = session.selfWxid
+    if (sender.replace(/^wxid_/, '') === self.replace(/^wxid_/, '')) return true
+    const cleanSuffix = (id: string) => id.trim().replace(/_[a-zA-Z0-9]{4}$/, '')
+    return cleanSuffix(sender) === cleanSuffix(self)
+}
 
 export function GlobalSessionMonitor() {
     const {
@@ -23,19 +35,6 @@ export function GlobalSessionMonitor() {
         sessionsRef.current = sessions
     }, [sessions])
 
-    // 从系统睡眠恢复后，数据库可能连续发出一批休眠期间积累的 Session 变更。
-    // 静默一段时间并在变更持续时延长静默，期间仍刷新会话状态作为新通知基线。
-    useEffect(() => {
-        const removeResumeListener = window.electronAPI.app.onSystemResume(() => {
-            const now = Date.now()
-            notificationQuietUntilRef.current = now + RESUME_NOTIFICATION_QUIET_MS
-            notificationQuietMaxUntilRef.current = now + RESUME_NOTIFICATION_MAX_MS
-            console.info('[NotificationFilter] Suppressing catch-up notifications after system resume')
-        })
-
-        return () => removeResumeListener()
-    }, [])
-
     // 去重辅助函数：获取消息 key
     const getMessageKey = (msg: Message) => {
         if (msg.messageKey) return msg.messageKey
@@ -46,9 +45,26 @@ export function GlobalSessionMonitor() {
     // 每次全量 getSessions + 富化的 IPC 成本高，合并突发事件只刷新一次）
     useEffect(() => {
         let debounceTimer: ReturnType<typeof setTimeout> | null = null
+        let resumeDeadlineTimer: ReturnType<typeof setTimeout> | null = null
         let refreshing = false
         let pendingRefresh = false
         let pendingRefreshSuppressNotifications = false
+        let scheduledSuppressNotifications = false
+        let lastRefreshStartedAt = 0
+        let sessionChangeSequence = 0
+        let resumeDirty = false
+        let disposed = false
+
+        const scheduleRefresh = (delay: number, suppressNotifications: boolean) => {
+            if (debounceTimer) clearTimeout(debounceTimer)
+            scheduledSuppressNotifications = suppressNotifications
+            const earliestNextRefresh = lastRefreshStartedAt + MIN_SESSION_REFRESH_INTERVAL_MS
+            const remainingInterval = Math.max(0, earliestNextRefresh - Date.now())
+            debounceTimer = setTimeout(() => {
+                debounceTimer = null
+                void runRefresh(scheduledSuppressNotifications)
+            }, Math.max(delay, remainingInterval))
+        }
 
         const runRefresh = async (suppressNotifications = false) => {
             if (refreshing) {
@@ -57,18 +73,57 @@ export function GlobalSessionMonitor() {
                 return
             }
             refreshing = true
+            lastRefreshStartedAt = Date.now()
+            const refreshSequence = sessionChangeSequence
             try {
-                await refreshSessions(suppressNotifications)
+                const success = await refreshSessions(suppressNotifications)
+                if (success && refreshSequence === sessionChangeSequence) resumeDirty = false
             } finally {
                 refreshing = false
-                if (pendingRefresh) {
+                if (pendingRefresh && !disposed) {
                     pendingRefresh = false
                     const suppressPending = pendingRefreshSuppressNotifications
                     pendingRefreshSuppressNotifications = false
-                    void runRefresh(suppressPending)
+                    // 读取期间的事件只需要一次尾随刷新。若新事件已有定时器，
+                    // 让它继续防抖，避免在微信持续同步时形成全量读取循环。
+                    if (!debounceTimer) {
+                        const now = Date.now()
+                        const recoveryDelay = Math.min(
+                            RESUME_NOTIFICATION_SETTLE_MS,
+                            Math.max(0, notificationQuietMaxUntilRef.current - now)
+                        )
+                        scheduleRefresh(
+                            now < notificationQuietMaxUntilRef.current
+                                ? recoveryDelay
+                                : SESSION_CHANGE_DEBOUNCE_MS,
+                            suppressPending
+                        )
+                    } else if (suppressPending) {
+                        scheduledSuppressNotifications = true
+                    }
                 }
             }
         }
+
+        const removeResumeListener = window.electronAPI.app.onSystemResume(() => {
+            const now = Date.now()
+            sessionChangeSequence += 1
+            resumeDirty = true
+            notificationQuietUntilRef.current = now + RESUME_NOTIFICATION_QUIET_MS
+            notificationQuietMaxUntilRef.current = now + RESUME_NOTIFICATION_MAX_MS
+            // 文件监听器可能在睡眠期间丢失事件。恢复后主动读取一次基线，
+            // 并与接下来收到的 Session 变更合并。
+            scheduleRefresh(RESUME_NOTIFICATION_SETTLE_MS, true)
+            if (resumeDeadlineTimer) clearTimeout(resumeDeadlineTimer)
+            resumeDeadlineTimer = setTimeout(() => {
+                resumeDeadlineTimer = null
+                if (!resumeDirty) return
+                if (debounceTimer) clearTimeout(debounceTimer)
+                debounceTimer = null
+                void runRefresh(true)
+            }, RESUME_NOTIFICATION_MAX_MS)
+            console.info('[NotificationFilter] Scheduling a silent session resync after system resume')
+        })
 
         const handleDbChange = (_event: any, data: { type: string; json: string }) => {
             try {
@@ -77,45 +132,39 @@ export function GlobalSessionMonitor() {
 
                 // 只关注 Session 表
                 if (tableName === 'Session' || tableName === 'session') {
+                    sessionChangeSequence += 1
                     const now = Date.now()
                     if (now < notificationQuietMaxUntilRef.current) {
+                        resumeDirty = true
                         notificationQuietUntilRef.current = Math.min(
                             notificationQuietMaxUntilRef.current,
                             now + RESUME_NOTIFICATION_SETTLE_MS
                         )
 
                         // 睡眠恢复的补同步可能连续改写 Session。先合并这些事件，
-                        // 等变更安静下来后只读一次完整会话快照。
-                        if (debounceTimer) clearTimeout(debounceTimer)
+                        // 等变更安静下来后合并读取会话快照。
                         const catchupDelay = Math.min(
                             RESUME_NOTIFICATION_SETTLE_MS,
                             Math.max(0, notificationQuietMaxUntilRef.current - now)
                         )
-                        debounceTimer = setTimeout(() => {
-                            debounceTimer = null
-                            void runRefresh(true)
-                        }, catchupDelay)
+                        scheduleRefresh(catchupDelay, true)
                         return
                     }
-                    if (debounceTimer) clearTimeout(debounceTimer)
-                    debounceTimer = setTimeout(() => {
-                        debounceTimer = null
-                        void runRefresh()
-                    }, 400)
+                    scheduleRefresh(SESSION_CHANGE_DEBOUNCE_MS, false)
                 }
             } catch (e) {
                 console.error('解析数据库变更失败:', e)
             }
         }
 
-        if (window.electronAPI.chat.onWcdbChange) {
-            const removeListener = window.electronAPI.chat.onWcdbChange(handleDbChange)
-            return () => {
-                if (debounceTimer) clearTimeout(debounceTimer)
-                removeListener()
-            }
+        const removeListener = window.electronAPI.chat.onWcdbChange?.(handleDbChange)
+        return () => {
+            disposed = true
+            if (debounceTimer) clearTimeout(debounceTimer)
+            if (resumeDeadlineTimer) clearTimeout(resumeDeadlineTimer)
+            removeResumeListener()
+            removeListener?.()
         }
-        return () => { }
     }, [])
 
     // 注意：导出统计的预加载已移除（前端全量预载曾导致内存从 200MB 飙升到 500+MB，
@@ -123,44 +172,43 @@ export function GlobalSessionMonitor() {
     // 导出页打开时按需拉取可见批次的会话统计，主进程有磁盘缓存兜底，响应速度足够快。
 
 
-    const refreshSessions = async (suppressNotifications = false) => {
+    const refreshSessions = async (suppressNotifications = false): Promise<boolean> => {
         try {
             const result = await window.electronAPI.chat.getSessions()
             if (result.success && result.sessions && Array.isArray(result.sessions)) {
                 const newSessions = result.sessions as ChatSession[]
                 const oldSessions = sessionsRef.current
 
-                // 1. 检测变更并通知。恢复静默期间只更新基线，不逐条补发通知。
+                // 先更新会话列表。通知需要额外查询联系人，不能让弹窗准备阻塞界面。
+                sessionsRef.current = newSessions
+                setSessions(newSessions)
+
+                // 活跃会话的消息刷新也应先于通知联系人查询启动。
+                const currentId = useChatStore.getState().currentSessionId
+                if (currentId) {
+                    const currentSessionNew = newSessions.find(s => s.username === currentId)
+                    const currentSessionOld = oldSessions.find(s => s.username === currentId)
+                    if (currentSessionNew && (!currentSessionOld || currentSessionNew.lastTimestamp > currentSessionOld.lastTimestamp)) {
+                        void handleActiveSessionRefresh(currentId)
+                    }
+                }
+
+                // 恢复静默期间只更新基线，不逐条补发通知。
                 if (!suppressNotifications && Date.now() >= notificationQuietUntilRef.current) {
                     await checkForNewMessages(oldSessions, newSessions)
                 } else {
                     console.info('[NotificationFilter] Skipping notifications while session state catches up')
                 }
 
-                // 立即同步 ref，确保后续排队刷新以最新快照作比较基线。
-                sessionsRef.current = newSessions
-
-                // 2. 更新 store
-                setSessions(newSessions)
-
                 // 注意：不再在每次 Session 变更时全量预载导出统计
                 // （2000+ 会话 × 多库统计查询的 IPC 风暴是卡顿主因之一；
                 // 导出页会按需拉取可见行的统计，主进程有磁盘缓存兜底）
-
-                // 3. 如果在活跃会话中，增量刷新消息
-                const currentId = useChatStore.getState().currentSessionId
-                if (currentId) {
-                    const currentSessionNew = newSessions.find(s => s.username === currentId)
-                    const currentSessionOld = oldSessions.find(s => s.username === currentId)
-
-                    if (currentSessionNew && (!currentSessionOld || currentSessionNew.lastTimestamp > currentSessionOld.lastTimestamp)) {
-                        void handleActiveSessionRefresh(currentId)
-                    }
-                }
+                return true
             }
         } catch (e) {
             console.error('全局会话刷新失败:', e)
         }
+        return false
     }
 
     const checkForNewMessages = async (oldSessions: ChatSession[], newSessions: ChatSession[]) => {
@@ -171,7 +219,22 @@ export function GlobalSessionMonitor() {
 
         const oldMap = new Map(oldSessions.map(s => [s.username, s]))
 
-        for (const newSession of newSessions) {
+        // 一次快照可能包含大量会话变化。先在内存中筛选，避免为每个会话
+        // 查询联系人并反复创建通知窗口。突发更新只显示最近的一条。
+        const changedSessions = newSessions.filter(newSession => {
+            const oldSession = oldMap.get(newSession.username)
+            if (newSession.username === useChatStore.getState().currentSessionId) return false
+            if (oldSession && newSession.lastTimestamp <= oldSession.lastTimestamp) return false
+            if (newSession.isMuted || newSession.isFolded) return false
+            if (newSession.username.toLowerCase().includes('placeholder_foldgroup')) return false
+            if (newSession.unreadCount <= (oldSession?.unreadCount ?? 0)) return false
+
+            return !isOwnGroupMessage(newSession)
+        }).sort((a, b) => b.lastTimestamp - a.lastTimestamp)
+        const isBurst = changedSessions.length > 1
+        const notifications = changedSessions.slice(0, MAX_NOTIFICATION_CANDIDATES_PER_REFRESH)
+
+        for (const newSession of notifications) {
             // 如果系统在通知联系人信息查询期间进入睡眠并恢复，停止当前补发循环。
             if (Date.now() < notificationQuietUntilRef.current) return
 
@@ -187,89 +250,11 @@ export function GlobalSessionMonitor() {
                 if (newSession.isMuted || newSession.isFolded) continue
                 if (newSession.username.toLowerCase().includes('placeholder_foldgroup')) continue
 
-                // 1. 群聊过滤自己发送的消息
-                if (newSession.username.includes('@chatroom')) {
-                    // 如果是自己发的消息，不弹通知
-                    // 注意：lastMsgSender 需要后端支持返回
-                    // 使用宽松比较以处理 wxid_ 前缀差异
-                    if (newSession.lastMsgSender && newSession.selfWxid) {
-                        const sender = newSession.lastMsgSender.replace(/^wxid_/, '');
-                        const self = newSession.selfWxid.replace(/^wxid_/, '');
-
-                        // 使用主进程日志打印，方便用户查看
-                        const debugInfo = {
-                            type: 'NotificationFilter',
-                            username: newSession.username,
-                            lastMsgSender: newSession.lastMsgSender,
-                            selfWxid: newSession.selfWxid,
-                            senderClean: sender,
-                            selfClean: self,
-                            match: sender === self
-                        };
-
-                        if (window.electronAPI.log?.debug) {
-                            window.electronAPI.log.debug(debugInfo);
-                        } else {
-                            console.log('[NotificationFilter]', debugInfo);
-                        }
-
-                        if (sender === self) {
-                            if (window.electronAPI.log?.debug) {
-                                window.electronAPI.log.debug('[NotificationFilter] Filtered own message');
-                            } else {
-                                console.log('[NotificationFilter] Filtered own message');
-                            }
-                            continue;
-                        }
-                    } else {
-                        const missingInfo = {
-                            type: 'NotificationFilter Missing info',
-                            lastMsgSender: newSession.lastMsgSender,
-                            selfWxid: newSession.selfWxid
-                        };
-                        if (window.electronAPI.log?.debug) {
-                            window.electronAPI.log.debug(missingInfo);
-                        } else {
-                            console.log('[NotificationFilter] Missing info:', missingInfo);
-                        }
-                    }
-                }
-
-                // 新增：如果未读数量没有增加，说明可能是自己在其他设备回复（或者已读），不弹通知
-                const oldUnread = oldSession ? oldSession.unreadCount : 0
-                const newUnread = newSession.unreadCount
-                if (newUnread <= oldUnread) {
-                    // 仅仅是状态同步（如自己在手机上发消息 or 已读），跳过通知
-                    continue
-                }
-
                 let title = displayNameOrFallback(newSession.username, newSession.displayName)
                 let avatarUrl = newSession.avatarUrl
                 let content = newSession.summary || '[新消息]'
 
                 if (newSession.username.includes('@chatroom')) {
-                    // 1. 群聊过滤自己发送的消息
-                    // 辅助函数：清理 wxid 后缀 (如 _8602)
-                    const cleanWxid = (id: string) => {
-                        if (!id) return '';
-                        const trimmed = id.trim();
-                        // 仅移除末尾的 _xxxx (4位字母数字)
-                        const suffixMatch = trimmed.match(/^(.+)_([a-zA-Z0-9]{4})$/);
-                        return suffixMatch ? suffixMatch[1] : trimmed;
-                    }
-
-                    if (newSession.lastMsgSender && newSession.selfWxid) {
-                        const senderClean = cleanWxid(newSession.lastMsgSender);
-                        const selfClean = cleanWxid(newSession.selfWxid);
-                        const match = senderClean === selfClean;
-
-                        if (match) {
-                            continue;
-                        }
-                    }
-
-                    // 2. 群聊显示发送者名字 (放在内容中: "Name: Message")
-                    // 标题保持为群聊名称 (title 变量)
                     const lastSenderDisplayName = pickDisplayName(newSession.lastSenderDisplayName)
                     if (lastSenderDisplayName) {
                         content = `${lastSenderDisplayName}: ${content}`
@@ -339,12 +324,13 @@ export function GlobalSessionMonitor() {
                 // 调用 IPC 以显示独立窗口通知
                 window.electronAPI.notification?.show({
                     title: title,
-                    content: content,
+                    content: isBurst ? `${content}（另有会话更新）` : content,
                     avatarUrl: avatarUrl,
                     sessionId: newSession.username
                 })
 
-                // 我们不再为 Toast 设置本地状态
+                // 通知窗口一次只能呈现一条。其他会话已进入列表，避免弹窗连发。
+                break
             }
         }
     }
