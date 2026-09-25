@@ -37,6 +37,9 @@ export function setNotificationNavigateHandler(
 
 let notificationWindow: BrowserWindow | null = null;
 let closeTimer: NodeJS.Timeout | null = null;
+let latestWindowNotificationRequest = 0;
+let pendingLoadedNotification: { data: any; requestId: number } | null = null;
+let pendingReadyWindow: BrowserWindow | null = null;
 
 // 空闲销毁：隐藏的通知窗口（含渲染进程）常驻占用 ~120MB 工作集，
 // 通知稀少时不值得养着。隐藏后闲置超时即销毁，下一条通知重新冷启动
@@ -165,6 +168,9 @@ function refreshDesktopSourceId(): Promise<void> {
 
 export function destroyNotificationWindow() {
   cancelIdleDestroy();
+  latestWindowNotificationRequest += 1;
+  pendingLoadedNotification = null;
+  pendingReadyWindow = null;
   if (closeTimer) {
     clearTimeout(closeTimer);
     closeTimer = null;
@@ -325,13 +331,25 @@ export async function showNotification(data: any) {
 
   if (!win) return;
 
+  const requestId = ++latestWindowNotificationRequest;
   // 确保加载完成
   if (win.webContents.isLoading()) {
-    win.once("ready-to-show", () => {
-      showAndSend(win!, data);
-    });
+    // 冷启动时只保留最后一条，避免同步积压的通知各自注册一次回调。
+    pendingLoadedNotification = { data, requestId };
+    if (pendingReadyWindow !== win) {
+      pendingReadyWindow = win;
+      win.once("ready-to-show", () => {
+        pendingReadyWindow = null;
+        const pending = pendingLoadedNotification;
+        pendingLoadedNotification = null;
+        if (pending && !win.isDestroyed()) {
+          void showAndSend(win, pending.data, pending.requestId);
+        }
+      });
+    }
   } else {
-    showAndSend(win, data);
+    pendingLoadedNotification = null;
+    void showAndSend(win, data, requestId);
   }
 }
 
@@ -364,9 +382,10 @@ async function showViaSystemNotification(data: any) {
 
 let lastNotificationData: any = null;
 
-async function showAndSend(win: BrowserWindow, data: any) {
+async function showAndSend(win: BrowserWindow, data: any, requestId: number) {
   const config = ConfigService.getInstance();
   const position = (await config.get("notificationPosition")) || "top-right";
+  if (requestId !== latestWindowNotificationRequest || win.isDestroyed()) return;
 
   // 更新位置：基于工作区完整矩形（含原点偏移）定位。
   // macOS 菜单栏、Windows 任务栏靠上/靠左时工作区原点不为 (0,0)，
@@ -410,6 +429,7 @@ async function showAndSend(win: BrowserWindow, data: any) {
   // 除此之外通知路径不触碰 desktopCapturer，弹出过程主线程零阻塞。
   // 原生玻璃可用时折射由原生面板提供，渲染层不再开启 Chromium 桌面流
   if (!nativeGlass && !cachedSourceId) await refreshDesktopSourceId();
+  if (requestId !== latestWindowNotificationRequest || win.isDestroyed()) return;
   const payload = {
     ...data,
     position,
